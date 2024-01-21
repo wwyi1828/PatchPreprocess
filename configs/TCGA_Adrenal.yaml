@@ -1,0 +1,4 @@
+label_file : 'TCGA_Adrenal.csv'
+src_folder : '/media/weiyi/My Passport/Data/Extracted_IMAGES/TCGA_Adrenal/patches/'
+xml_folder : None
+dst_file: '/pool1/data/Adrenal_R50.pkl'

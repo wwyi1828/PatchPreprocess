@@ -1,0 +1,6 @@
+dataset_name : 'BRACS'
+label_file : 'BRACS.csv'
+src_folder : '/pool1/data/Extracted_IMAGES/BRACS_val/patches/'
+# xml_folder : '/media/weiyi/My Passport/Data/CAMELYON16/testing/lesion_annotations'
+dst_file: '/data/data/BRACS_R50_val.pkl'
+# ckpt_path: '/data/checkpoints/b512_clubyol_bracs_49.pth.tar'
