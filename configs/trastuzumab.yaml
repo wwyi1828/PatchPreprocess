@@ -1,0 +1,5 @@
+dataset_name : 'trastuzumab'
+label_file : 'labels/trastuzumab.csv'
+src_folder : '/data/data/Extracted_IMAGES/trastuzumab/patches/'
+xml_folder : '/data/data/ST/trastuzumab/Annotations'
+dst_file: '/pool1/data/trastuzumab_PLIP'

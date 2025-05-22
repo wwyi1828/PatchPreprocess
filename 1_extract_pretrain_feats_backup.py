@@ -90,96 +90,6 @@ class PNGDataset(Dataset):
             return image, coord
 
 
-from shapely.geometry import Polygon, MultiPolygon, box
-from shapely.ops import unary_union
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from rtree import index
-from lxml import etree
-import tempfile
-
-def xml_position(xml_path, ds_factor=2):
-    root = ET.parse(xml_path).getroot()
-    idx = index.Index()  # 空间索引
-    polygons = []
-    
-    for annotation in root.findall('.//Annotation'):
-        coords = []
-        coordinate_elements = annotation.findall('.//Coordinate')
-        if not coordinate_elements:
-            coordinate_elements = annotation.findall('.//Vertex')
-
-        # for coordinate in annotation.findall('.//Coordinate'):
-        for coordinate in coordinate_elements:
-            x = float(coordinate.get('X'))
-            y = float(coordinate.get('Y'))
-            coords.append((x/ds_factor, y/ds_factor))
-        # if len(coords) < 4:
-        if len(coords) < 3: # was 4
-            print(f"Skipping invalid coordinates: {coords}")
-            continue  # skip to the next annotation
-        poly = Polygon(coords)
-        if not poly.is_valid:
-            poly = poly.buffer(1e-6)
-        polygons.append(poly)
-        idx.insert(len(polygons)-1, poly.bounds)  # 将多边形添加到索引中
-
-    positive_polygons = []
-    negative_polygons = []
-
-    for pos, poly in enumerate(polygons):
-        possible_overlaps = list(idx.intersection(poly.bounds))
-        is_negative = any(polygons[other_pos].contains(poly) and other_pos != pos for other_pos in possible_overlaps)
-        if is_negative:
-            negative_polygons.append(poly)
-        else:
-            positive_polygons.append(poly)
-
-    positive_union = unary_union(positive_polygons)
-    negative_union = unary_union(negative_polygons)
-    
-    return positive_union, negative_union
-
-def safe_xml_position(xml_path, ds_factor=2):
-    try:
-        # 尝试直接调用原始函数
-        return xml_position(xml_path, ds_factor)
-    except ET.ParseError as e:
-        print(f"捕获XML解析错误: {e}，尝试自动修复...")
-        
-        try:
-            # 读取原始内容
-            with open(xml_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # 添加根元素包装内容
-            fixed_content = f'<root>\n{content}\n</root>'
-            
-            # 使用lxml解析修复后的内容
-            parser = etree.XMLParser(recover=True)
-            root = etree.fromstring(fixed_content.encode('utf-8'), parser)
-            
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(suffix='.xml', delete=False) as temp:
-                temp_path = temp.name
-                temp.write(etree.tostring(root, encoding='utf-8'))
-            
-            print(f"使用临时修复文件: {temp_path}")
-            
-            try:
-                # 使用临时文件调用原始函数
-                result = xml_position(temp_path, ds_factor)
-                return result
-            finally:
-                # 无论成功与否，都删除临时文件
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-                    print(f"已删除临时文件: {temp_path}")
-        
-        except Exception as inner_e:
-            print(f"修复尝试失败: {inner_e}")
-            raise e  # 重新抛出原始错误
-
 
 # Create a TensorDataset and DataLoader
 slide_labels = pd.read_csv(config['label_file'])
@@ -197,24 +107,11 @@ elif config['dataset_name'] == 'TCGA_LUNG':
     label_convert_dict = {'TCGA_LUAD': 0, 'TCGA_LUSC':1} 
 elif config['dataset_name'] == 'TCGA_LGG':
     label_convert_dict = {'Astrocytoma': 0, 'Oligodendroglioma': 1, 'Oligoastrocytoma': 2, 'Low-Grade Glioma': 3} 
-elif config['dataset_name'] == 'TCGA_BRAC':
-    label_convert_dict = {'Infiltrating Ductal Carcinoma': 0, 'Infiltrating Lobular Carcinoma': 1, 'Other': 2} 
-elif config['dataset_name'] == 'TCGA_COAD':
-    label_convert_dict = {'Colon Adenocarcinoma': 0, 'Colon Adenocarcinoma, Mucinous Type': 1, 'Unknown': 2} 
-elif config['dataset_name'] == 'BACH':
-    label_convert_dict = {'negative': 0, 'positive': 1} 
-elif config['dataset_name'] == 'trastuzumab':
-    label_convert_dict = {'nonresponder': 0, 'responder': 1}
-elif config['dataset_name'] == 'Yale_HER2':
-    label_convert_dict = {'negative': 0, 'positive': 1} 
 # slide_labels = {key.split('.')[0]: {'Normal': 0, 'Tumor': 1}[value] for key, value in slide_labels.items()}
 # slide_labels = {key.split(f'.')[0]: {'TCGA_ACC': 0, 'TCGA_PCPG': 1}[value] for key, value in slide_labels.items()}
 slide_labels = {key.split(f'.')[0]: label_convert_dict[value] for key, value in slide_labels.items()}
 
-dst_file = Path(config['dst_file'])
-if dst_file.suffix == '.pkl':
-    target_objs = []
-
+target_objs = []
 # src_folder = '/pool1/data/Extracted_IMAGES/Camelyon16_test/patches/'
 src_folder = config['src_folder']
 
@@ -296,75 +193,27 @@ if args.model_type == 'UNI':
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ]
     )
-if args.model_type == 'UNIv2':
-    # from huggingface_hub import hf_hub_download
-    local_dir = "/data/checkpoints/UNIv2"
-    # os.makedirs(local_dir, exist_ok=True)  # create directory if it does not exist
-    # hf_hub_download("MahmoodLab/UNI2-h", filename="pytorch_model.bin", local_dir=local_dir, force_download=True)
-    timm_kwargs = {
-                'model_name': 'vit_giant_patch14_224',
-                'img_size': 224, 
-                'patch_size': 14, 
-                'depth': 24,
-                'num_heads': 24,
-                'init_values': 1e-5, 
-                'embed_dim': 1536,
-                'mlp_ratio': 2.66667*2,
-                'num_classes': 0, 
-                'no_embed_class': True,
-                'mlp_layer': timm.layers.SwiGLUPacked, 
-                'act_layer': torch.nn.SiLU, 
-                'reg_tokens': 8, 
-                'dynamic_img_size': True
-            }
-    model = timm.create_model(
-        pretrained=False, **timm_kwargs
-    )
-    model.load_state_dict(torch.load(os.path.join(local_dir, "pytorch_model.bin"), map_location="cpu"), strict=True)
-    image_processor = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ]
-    )
-    model.eval()
 if args.model_type == 'CONCH':
     print('Load CONCH weights')
     from conch.open_clip_custom import create_model_from_pretrained
     model, image_processor = create_model_from_pretrained('conch_ViT-B-16', "/data/checkpoints/CONCH/pytorch_model.bin")
-if args.model_type == 'CTrans':
-    print('Load CTrans weights')
-    from ctran import ctranspath
-    mean = (0.485, 0.456, 0.406)
-    std = (0.229, 0.224, 0.225)
-    image_processor = transforms.Compose(
-        [
-            transforms.Resize(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean = mean, std = std)
-        ]
-    )
-    model = ctranspath()
-    model.head = nn.Identity()
-    td = torch.load('/data/checkpoints/ctranspath.pth')
-    model.load_state_dict(td['model'], strict=True)
-
 
 model.eval()
 model.cuda()
 model.to(device)
 
+
 # processed_slides = {obj.slide_index for obj in target_objs}
 for slide_h5 in tqdm(os.listdir(src_folder)):
     slide_name = slide_h5.split('.')[0]
+
     # if slide_name in processed_slides:
     #     continue
     if False:
         dataset = H5Dataset(f'{src_folder}{slide_h5}')
     else:
         dataset = PNGDataset(f'{src_folder}{slide_h5}', image_processor)
-    # print(slide_name, len(dataset), f'{src_folder}{slide_h5}')
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=12, pin_memory=True, prefetch_factor=6)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=12, pin_memory=True)
 
     features_list = []
     position_list = []
@@ -409,44 +258,113 @@ for slide_h5 in tqdm(os.listdir(src_folder)):
             y = None, 
             graph_y = graph_y,
             slide_index = slide_name)
+        target_objs.append(a_graph)
 
-        if 'xml_folder' in config:
-            print("xml_folder is defined and its value is:", config['xml_folder'], slide_name)
-
-            xml_folder = config['xml_folder']
-            ds_factor = 1
-            patch_size = 224
-            xml_folder = Path(xml_folder)
-
-            xml_item = xml_folder.joinpath(f'{a_graph.slide_index}.xml')
-            if xml_item.exists():
-                positive_union, negative_union = safe_xml_position(xml_item, ds_factor=ds_factor)
-                annot_coordinates = positive_union.difference(negative_union)  # 计算正多边形与负多边形的差集
-            else:
-                annot_coordinates = MultiPolygon()
-
-            overlap_ratios = []
-            for pcoord in a_graph.pos:
-                patch_box = box(pcoord[0], pcoord[1], pcoord[0] + patch_size, pcoord[1] + patch_size)
-                intersection = patch_box.intersection(annot_coordinates)
-                ratio = intersection.area / patch_box.area
-                overlap_ratios.append(ratio)
-            a_graph.y = torch.stack([torch.tensor(_) for _ in overlap_ratios])
-        
-        if dst_file.suffix == '.pkl':
-            target_objs.append(a_graph)
-        else:
-            dst_file.mkdir(parents=True, exist_ok=True)
-            slide_name = a_graph.slide_index
+dst_file = Path(config['dst_file'])
+# if config['dataset_name'] != 'Camelyon16':
+if 'xml_folder' not in config:
+    print('no xml folder')
+    # pickle.dump(target_objs, open('/media/weiyi/My Passport/Data/C16_test.pkl','wb'))
+    if dst_file.suffix == '.pkl':
+        pickle.dump(target_objs, open(str(dst_file),'wb'))
+        # pickle.dump(target_objs, open(config['dst_file'],'wb'))
+    else:
+        dst_file.mkdir(parents=True, exist_ok=True)
+        for target_obj in target_objs:
+            slide_name = target_obj.slide_index
             h5_file_path = dst_file / f"{slide_name}.h5"
-
+            
             with h5py.File(str(h5_file_path), 'w') as f:
-                f.create_dataset('feats', data=a_graph.x.cpu())
-                f.create_dataset('cords', data=a_graph.pos.cpu())
-                if a_graph.y is not None:
-                    f.create_dataset('ratios', data=a_graph.y.cpu())
-                if a_graph.graph_y is not None:
-                    f.create_dataset('label', data=a_graph.graph_y.cpu())
+                f.create_dataset('feats', data=target_obj.x.cpu())
+                f.create_dataset('cords', data=target_obj.pos.cpu())
+                if target_obj.graph_y is not None:
+                    f.create_dataset('label', data=target_obj.graph_y.cpu())
+else:
+    print("xml_folder is defined and its value is:", config['xml_folder'])
+    from shapely.geometry import Polygon, MultiPolygon, box
+    from shapely.ops import unary_union
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+    from rtree import index
 
-if dst_file.suffix == '.pkl':
-    pickle.dump(target_objs, open(str(dst_file),'wb'))
+
+    def xml_position(xml_path, ds_factor=2):
+        root = ET.parse(xml_path).getroot()
+        idx = index.Index()  # 空间索引
+        polygons = []
+        
+        for annotation in root.findall('.//Annotation'):
+            coords = []
+            for coordinate in annotation.findall('.//Coordinate'):
+                x = float(coordinate.get('X'))
+                y = float(coordinate.get('Y'))
+                coords.append((x/ds_factor, y/ds_factor))
+            if len(coords) < 4:
+                print(f"Skipping invalid coordinates: {coords}")
+                continue  # skip to the next annotation
+            poly = Polygon(coords)
+            if not poly.is_valid:
+                poly = poly.buffer(1e-6)
+            polygons.append(poly)
+            idx.insert(len(polygons)-1, poly.bounds)  # 将多边形添加到索引中
+
+        positive_polygons = []
+        negative_polygons = []
+
+        for pos, poly in enumerate(polygons):
+            possible_overlaps = list(idx.intersection(poly.bounds))
+            is_negative = any(polygons[other_pos].contains(poly) and other_pos != pos for other_pos in possible_overlaps)
+            if is_negative:
+                negative_polygons.append(poly)
+            else:
+                positive_polygons.append(poly)
+
+        positive_union = unary_union(positive_polygons)
+        negative_union = unary_union(negative_polygons)
+        
+        return positive_union, negative_union
+
+    # xml_folder = '/media/weiyi/My Passport/Data/CAMELYON16/training/lesion_annotations'
+    # xml_folder = '/media/weiyi/My Passport/Data/CAMELYON16/testing/lesion_annotations'
+    xml_folder = config['xml_folder']
+    ds_factor = 2
+    patch_size = 224
+    xml_folder = Path(xml_folder)
+
+    for target_obj in tqdm(target_objs):
+        xml_item = xml_folder.joinpath(f'{target_obj.slide_index}.xml')
+        if xml_item.exists():
+            positive_union, negative_union = xml_position(xml_item)
+            annot_coordinates = positive_union.difference(negative_union)  # 计算正多边形与负多边形的差集
+        else:
+            annot_coordinates = MultiPolygon()
+
+        overlap_ratios = []
+        for pcoord in target_obj.pos:
+            patch_box = box(pcoord[0], pcoord[1], pcoord[0] + patch_size, pcoord[1] + patch_size)
+            intersection = patch_box.intersection(annot_coordinates)
+            ratio = intersection.area / patch_box.area
+            overlap_ratios.append(ratio)
+        target_obj.y = torch.stack([torch.tensor(_) for _ in overlap_ratios])
+        # if target_obj.graph_y==1:
+        #     print(target_obj.slide_index, np.array(overlap_ratios).max(), (np.array(overlap_ratios)>0.08).sum())
+
+
+    # pickle.dump(target_objs, open('/media/weiyi/My Passport/Data/C16_test.pkl','wb'))
+    # pickle.dump(target_objs, open(config['dst_file'],'wb'))
+    if dst_file.suffix == '.pkl':
+        pickle.dump(target_objs, open(str(dst_file),'wb'))
+        # pickle.dump(target_objs, open(config['dst_file'],'wb'))
+    else:
+        dst_file.mkdir(parents=True, exist_ok=True)
+        for target_obj in target_objs:
+            slide_name = target_obj.slide_index
+            h5_file_path = dst_file / f"{slide_name}.h5"
+            
+            with h5py.File(str(h5_file_path), 'w') as f:
+                f.create_dataset('feats', data=target_obj.x.cpu())
+                f.create_dataset('cords', data=target_obj.pos.cpu())
+                if target_obj.y is not None:
+                    f.create_dataset('ratios', data=target_obj.y.cpu())
+                if target_obj.graph_y is not None:
+                    f.create_dataset('label', data=target_obj.graph_y.cpu())

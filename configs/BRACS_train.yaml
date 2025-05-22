@@ -1,6 +1,18 @@
+# dataset_name : 'BRACS'
+# label_file : 'BRACS.csv'
+# src_folder : '/pool1/data/Extracted_IMAGES/BRACS_train/patches/'
+# # xml_folder : '/media/weiyi/My Passport/Data/CAMELYON16/testing/lesion_annotations'
+# dst_file: '/data/data/BRACS_R50.pkl'
+# # ckpt_path: '/data/checkpoints/b512_clubyol_bracs_49.pth.tar'
+
+
+# dataset_name : 'BRACS'
+# label_file : 'BRACS.csv'
+# src_folder : '/pool1/data/Extracted_IMAGES/BRACS_train/patches/'
+# dst_folder: '/data/data/BRACS_raw/train'
+
+
 dataset_name : 'BRACS'
-label_file : 'BRACS.csv'
+label_file : 'labels/BRACS.csv'
 src_folder : '/pool1/data/Extracted_IMAGES/BRACS_train/patches/'
-# xml_folder : '/media/weiyi/My Passport/Data/CAMELYON16/testing/lesion_annotations'
-dst_file: '/data/data/BRACS_R50.pkl'
-# ckpt_path: '/data/checkpoints/b512_clubyol_bracs_49.pth.tar'
+dst_file: '/data/data/BRACS_UNIv2.pkl'

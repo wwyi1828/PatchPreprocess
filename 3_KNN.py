@@ -9,11 +9,18 @@ import pandas as pd
 from torch_geometric.data import Data as gData
 import numpy as np
 
+class CustomData:
+    def __init__(self, x, y, slide_index):
+        self.x = x  # 特征张量
+        self.y = y  # 标签张量
+        self.slide_index = slide_index  # 幻灯片索引
+
 missing = ['test_114']
-# feats_path = '/data/data/Old_CluSiam_R18'
-feats_path = '/data/data/CluSiam_A09R18'
+feats_path = '/data/data/C16_CluBYOLR18last'
+feats_path = '/data/data/spmil_pyg'
+# feats_path = '/data/data/C16_CluBYOLR50'
+feats_path = '/data/data/C16_R50'
 print(feats_path)
-# feats_path = '/pool1/data/C16_R50'
 training_data = pickle.load(open(f'{feats_path}.pkl', 'rb'))
 testing_data = pickle.load(open(f'{feats_path}_test.pkl', 'rb'))
 
@@ -103,10 +110,10 @@ def compute_topk_knn(test_feats, train_feats, test_labels, train_labels,
 
 
 
-k = 1
+k = 5
 device = torch.device("cuda")
 test_preds = compute_topk_knn(test_feats, train_feats, test_labels, train_labels,
                      k, train_batch_size, test_batch_size, device)
 
 print(feats_path)
-print(accuracy_score(test_labels, test_preds), f1_score(test_labels, test_preds))
+print(accuracy_score(test_labels, test_preds), f1_score(test_labels, test_preds), recall_score(test_labels, test_preds), precision_score(test_labels, test_preds))
