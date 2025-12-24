@@ -1,5 +1,5 @@
 dataset_name : 'Camelyon17'
-label_file : 'CAMELYON17.csv'
-src_folder : '/pool2/data/Extracted_IMAGES/Camelyon17/patches/'
+label_file : 'labels/CAMELYON17.csv'
+src_folder : '/pool2/data/Extracted_IMAGES/Camelyon17/patches/selected_patches/'
 xml_folder : '/data/data/CAMELYON17/training/lesion_annotations'
-dst_file: '/pool3/data/C17_CONCH'
+dst_file: '/pool3/data/C17_V2'

@@ -1,3 +1,4 @@
+import h5py
 import torch
 import copy
 import scanpy as sc
@@ -10,6 +11,7 @@ from transformers import pipeline
 from tqdm import tqdm
 import pybiomart as pbm
 import os
+import pickle
 import timm
 import json
 from pathlib import Path
@@ -17,33 +19,78 @@ import argparse
 from PIL import Image
 from utils_gene import *
 
-def is_xenium_dataset(dataset_name):
-    """Check if the dataset is a Xenium dataset"""
-    return dataset_name in ['Xenium_Lung', 'Xenium112_breast']
+def read_h5_data(file_path):
+    with h5py.File(file_path, 'r') as f:
+        barcodes = f['barcode'][()]
+        coords = f['coords'][()]
+        images = f['img'][()]
+        return barcodes, coords, images
 
-def filter_blank_genes(adata, verbose=False):
-    """Filter out BLANK_ genes from Xenium data"""
-    if verbose:
-        print(f"Before filtering BLANK_ genes: {adata.n_vars} genes")
+def create_barcode_mapping(gene_barcodes, image_barcodes):
+    image_barcode_list = [b.item().decode() if hasattr(b, 'item') else str(b) for b in image_barcodes]
+    barcode_to_image_idx = {barcode: idx for idx, barcode in enumerate(image_barcode_list)}
     
-    # Filter out genes starting with 'BLANK_'
-    blank_mask = (
-        adata.var_names.str.startswith('BLANK_') |
-        adata.var_names.str.startswith('NegControlProbe') |
-        adata.var_names.str.startswith('NegControlCodeword')
-    )
-    n_blank_genes = blank_mask.sum()
+    valid_gene_indices = []
+    valid_image_indices = []
     
-    if n_blank_genes > 0:
-        adata = adata[:, ~blank_mask].copy()
-        if verbose:
-            print(f"Filtered out {n_blank_genes} BLANK_ genes")
-            print(f"After filtering BLANK_ genes: {adata.n_vars} genes")
-    else:
-        if verbose:
-            print("No BLANK_ genes found")
+    for i, barcode in enumerate(gene_barcodes):
+        if barcode in barcode_to_image_idx:
+            valid_gene_indices.append(i)
+            valid_image_indices.append(barcode_to_image_idx[barcode])
+    return valid_gene_indices, valid_image_indices
+
+def create_ensembl_mapping(all_ensembl_ids, save_path, batch_size=100):
+    """
+    Create Ensembl ID to Gene Symbol mapping in batches and save to file
+    """
+    dataset = pbm.Dataset(name='hsapiens_gene_ensembl', host='http://www.ensembl.org')
     
-    return adata
+    all_mappings = {}
+    unique_ids = list(set(all_ensembl_ids))  # Remove duplicates
+    
+    print(f"Creating mapping for {len(unique_ids)} unique Ensembl IDs...")
+    
+    for i in range(0, len(unique_ids), batch_size):
+        batch_ids = unique_ids[i:i+batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(len(unique_ids)-1)//batch_size + 1} ({len(batch_ids)} IDs)")
+        
+        try:
+            results = dataset.query(
+                attributes=['ensembl_gene_id', 'hgnc_symbol', 'description'],
+                filters={'link_ensembl_gene_id': batch_ids}
+            )
+            
+            if i == 0:
+                print(f"Query result columns: {results.columns.tolist()}")
+            for _, row in results.iterrows():
+                if pd.notna(row['HGNC symbol']) and row['HGNC symbol'] != '':
+                    all_mappings[row['Gene stable ID']] = row['HGNC symbol']
+            
+            print(f"  Added {len(results)} mappings")
+            
+        except Exception as e:
+            print(f"  Error in batch {i//batch_size + 1}: {e}")
+            continue
+    
+    # Save mapping to file
+    with open(save_path, 'wb') as f:
+        pickle.dump(all_mappings, f)
+    
+    print(f"Saved {len(all_mappings)} mappings to {save_path}")
+    return all_mappings
+
+def convert_gene_names_to_symbols(adata, id_to_symbol):
+    """Convert Ensembl IDs to Gene Symbols for an AnnData object"""
+    new_var_names = []
+    for ensembl_id in adata.var_names:
+        if ensembl_id in id_to_symbol:
+            new_var_names.append(id_to_symbol[ensembl_id])
+        else:
+            new_var_names.append(ensembl_id)
+    
+    adata.var_names = new_var_names
+    converted_count = len([x for x in new_var_names if x in id_to_symbol.values()])
+    return adata, converted_count
 
 def pause_if_nonfinite(array, name, enabled):
     if not enabled:
@@ -75,13 +122,14 @@ def ensure_pil_image(image):
         arr = arr.astype(np.uint8)
     return Image.fromarray(np.ascontiguousarray(arr))
 
+
 parser = argparse.ArgumentParser(description='Read Configuration File')
-parser.add_argument('--dataset', type=str, default='NCBI_SKIN')
+parser.add_argument('--dataset', type=str, default='SPA_breast')
 parser.add_argument('--batch_size', type=int, default=512, 
                     help='Batch size for preprocessing.')
 parser.add_argument('--gene_prc', action='store_true')
 parser.add_argument('--imge_prc', type=str, default=None)
-parser.add_argument('--dst_pixelsize', type=float, default=55)
+parser.add_argument('--dst_pixelsize', type=float, default=100)
 parser.add_argument('--dst_file', default="/pool2/data/Mor2Mol")
 parser.add_argument('--normalize', action='store_true', 
                     help='Whether to apply normalize_total in individual dataset processing')
@@ -92,25 +140,25 @@ parser.add_argument('--pause_on_overflow', action='store_false',
 args = parser.parse_args()
 dst_file = Path(f"{args.dst_file}/{args.dataset}")
 
-# dataset_name = 'SPA_breast'
-dataset_name = args.dataset
+dataset_name = 'SPA_breast'
+# dataset_name = args.dataset
 if dataset_name == 'MISC_brain':
     target_dataset = [f'MISC{idx}' for idx in range(1,13)] #All 20x, Visium
 elif dataset_name == 'MISC_lung':
     target_dataset = [f'MISC{idx}' for idx in range(13,33)] #All 40x, have other available visium
 elif dataset_name == 'MISC_bowel':
     target_dataset = [f'MISC{idx}' for idx in range(33,74)] #40x, Visium
-elif dataset_name == 'MISC_heart':
-    target_dataset = [f'MISC{idx}' for idx in range(101,143)] #40x, Visium (119~127 20X)
-elif dataset_name == 'INT_kidney':
+elif dataset_name == 'INT_Lymphnode':
     target_dataset = [f'INT{idx}' for idx in range(1,25)]
 elif dataset_name == 'Xenium_Lung':
     target_dataset = [f'NCBI{idx}' for idx in range(856,885)]
-elif dataset_name == 'NCBI_skin':
+elif dataset_name == 'ColonMap':
+    target_dataset = [f'NCBI{idx}' for idx in range(33,74)]
+elif dataset_name == 'NCBI_SKIN':
     target_dataset = [f'NCBI{idx}' for idx in range(469,523)] # Visium, 20x, FFPE
 elif dataset_name == 'NCBI_brain':
     target_dataset = [f'NCBI{idx}' for idx in range(336,411)]
-elif dataset_name == 'NCBI_spinal':
+elif dataset_name == 'NCBI_Spinal':
     target_dataset = [f'NCBI{idx}' for idx in range(11,336)] # ST, Non Visium
 elif dataset_name == 'SPA_breast_1':
     target_dataset = [f'SPA{idx}' for idx in range(51,155)][0:68] # All 20x
@@ -118,47 +166,53 @@ elif dataset_name == 'SPA_breast_2':
     target_dataset = [f'SPA{idx}' for idx in range(51,155)][68:] # All 20x
 elif dataset_name == 'SPA_breast':
     target_dataset = [f'SPA{idx}' for idx in range(51,155)] # All 20x
-elif dataset_name == 'Xenium112_breast':
+elif dataset_name == 'TENX_Xenium_breast':
     target_dataset = [f'TENX{idx}' for idx in range(94, 100)]
-elif dataset_name == 'HD':
-    target_dataset = [f'HD{idx}' for idx in range(1,7)]
-
-data_dir = '/data/data/ST/HEST1K/st'
-existing_datasets = []
-missing_datasets = []
-for dataset_id in target_dataset:
-    file_path = os.path.join(data_dir, f'{dataset_id}.h5ad')
-    if os.path.exists(file_path):
-        existing_datasets.append(dataset_id)
-    else:
-        missing_datasets.append(dataset_id)
-print(f"# Total files: {len(target_dataset)}")
-print(f"# Existing files: {len(existing_datasets)}")
-print(f"# Missing files: {len(missing_datasets)}")
-if missing_datasets:
-    print(f"Missing files: {missing_datasets}")
-target_dataset = existing_datasets
 
 datastem = Path(f"/data/data/ST/HEST1K/")
+target_dataset_1 = [f'SPA{idx}' for idx in range(51,155)][0:68] # Ensemble
+target_dataset_2 = [f'SPA{idx}' for idx in range(51,155)][68:] # Symbol
 dst_file.mkdir(parents=True, exist_ok=True)
+
+
+# Load or create Ensembl to Symbol mapping
+mapping_file = datastem / "ensembl_to_symbol_mapping.pkl"
+if os.path.exists(mapping_file):
+    print("Loading existing Ensembl to Symbol mapping...")
+    with open(mapping_file, 'rb') as f:
+        id_to_symbol = pickle.load(f)
+    print(f"Loaded {len(id_to_symbol)} mappings")
+else:
+    print("Creating new Ensembl to Symbol mapping...")
+    all_ensembl_ids = set()
+    for item in target_dataset_1:
+        mol_path = datastem.joinpath(f'st/{item}.h5ad')
+        adata = sc.read_h5ad(mol_path)
+        adata = adata[:, ~adata.var_names.str.startswith('__ambiguous')]
+        all_ensembl_ids.update(adata.var_names.tolist())
+    id_to_symbol = create_ensembl_mapping(list(all_ensembl_ids), mapping_file)
+
 top_k = 2000
 
 if args.gene_prc:
     # Step 1: Process all datasets and combine to find HVG/HEG
     print("Step 1: Processing datasets to find HVG/HEG...")
     verbose = True
-    all_adata = []
-    for item in target_dataset:
+    all_adata_1 = []
+    all_adata_2 = []
+    
+    # Process dataset_1 (Ensembl IDs -> Gene Symbols)
+    print("Processing target_dataset_1 (Ensembl -> Symbol conversion)...")
+    for item in target_dataset_1:
         mol_path = datastem.joinpath(f'st/{item}.h5ad')
         adata = sc.read_h5ad(mol_path)
         
-        # Standardize gene names and aggregate expression (Sum)
-        adata = clean_var_names(adata, verbose=verbose)
-        adata = aggregate_adata(adata, verbose=verbose)
+        # 1. Standardize IDs (remove versions) then Map
+        adata = clean_var_names(adata, verbose=False)
+        adata = convert_ensembl_to_symbol(adata, id_to_symbol)
         
-        # Filter BLANK_ genes for Xenium datasets
-        if is_xenium_dataset(dataset_name):
-            adata = filter_blank_genes(adata, verbose)
+        # 2. Aggregate Duplicates (Sum)
+        adata = aggregate_adata(adata, verbose=verbose)
         
         # Filter to only include spots that have corresponding morphology data
         mor_path = datastem.joinpath(f'patches/{item}.h5')
@@ -171,10 +225,34 @@ if args.gene_prc:
         else:
             print(f"Warning: No morphology data found for {item}, using all spots")
         
-        all_adata.append(adata)
+        all_adata_1.append(adata)
+
+    # Process dataset_2 (already has Gene Symbols)
+    print("Processing target_dataset_2 (already Gene Symbols)...")
+    for item in target_dataset_2:
+        mol_path = datastem.joinpath(f'st/{item}.h5ad')
+        adata = sc.read_h5ad(mol_path)
+        
+        # Standardize and Aggregate
+        adata = clean_var_names(adata, verbose=verbose)
+        adata = aggregate_adata(adata, verbose=verbose)
+        
+        # Filter to only include spots that have corresponding morphology data
+        mor_path = datastem.joinpath(f'patches/{item}.h5')
+        if mor_path.exists():
+            barcodes, coords, images = read_h5_data(mor_path)
+            gene_barcodes = list(adata.obs.index)
+            valid_gene_indices, valid_image_indices = create_barcode_mapping(gene_barcodes, barcodes)
+            adata = adata[valid_gene_indices].copy()
+            print(f"Dataset {item}: Filtered to {len(valid_gene_indices)} spots with morphology data")
+        else:
+            print(f"Warning: No morphology data found for {item}, using all spots")
+        
+        all_adata_2.append(adata)
 
     # Combine all datasets for HVG/HEG selection
     print("Combining datasets for HVG/HEG selection...")
+    all_adata = all_adata_1 + all_adata_2
     combined_adata = ad.concat(all_adata, join='inner')
     combined_adata.obs_names_make_unique()
 
@@ -274,9 +352,15 @@ if args.imge_prc is not None:
             image_mean=[0.485, 0.456, 0.406],
             image_std=[0.229, 0.224, 0.225]
         )
+    elif model_type == 'Raw':
+        pass
+    else:
+        raise ValueError(f"Unsupported image processor type: {model_type}")
+
 
     if model_type != 'Raw':
         model.eval()
+
 
 ##########################
 for item in tqdm(target_dataset):
@@ -288,7 +372,7 @@ for item in tqdm(target_dataset):
     src_pixelsize = meta['pixel_size_um_estimated']
     dst_pixelsize = args.dst_pixelsize / 224
     patch_size_src = 224 * (dst_pixelsize / src_pixelsize)
-
+    
     if not mol_path.exists():
         tqdm.write(f"Gene file not found: {mol_path}, skipping...")
         continue
@@ -298,28 +382,19 @@ for item in tqdm(target_dataset):
 
     adata = sc.read_h5ad(mol_path)
     
-    # Standardize gene names and aggregate expression (Sum)
+    # 1. Clean and Map (if applicable)
     adata = clean_var_names(adata, verbose=True)
-    adata = aggregate_adata(adata, verbose=True)
+    if item in target_dataset_1:
+        adata = convert_ensembl_to_symbol(adata, id_to_symbol)
     
-    # Filter BLANK_ genes for Xenium datasets
-    if is_xenium_dataset(dataset_name):
-        adata = filter_blank_genes(adata, verbose=True)
+    # 2. Aggregate (Sum)
+    adata = aggregate_adata(adata, verbose=True)
 
     barcodes, coords, images = read_h5_data(mor_path)
     gene_barcodes = list(adata.obs.index)
     valid_gene_indices, valid_image_indices = create_barcode_mapping(gene_barcodes, barcodes)
     
     if args.gene_prc:
-        # Check if we have any matching indices
-        if len(valid_gene_indices) == 0:
-            tqdm.write(f"Warning: No matching barcodes found for {item}, skipping gene processing...")
-            continue
-            
-        if args.normalize:
-            sc.pp.normalize_total(adata, target_sum=1e4)
-        if args.log1p:
-            sc.pp.log1p(adata)
 
         # Filter adata to matched spots
         adata = adata[valid_gene_indices].copy()
@@ -348,11 +423,6 @@ for item in tqdm(target_dataset):
         normalized_x = (x_coords - x_min) / patch_size_src
         normalized_y = (y_coords - y_min) / patch_size_src
         normalized_coords = np.column_stack((normalized_x, normalized_y)).astype(np.float32)
-
-        # coords = coords[valid_image_indices].astype(np.float32)
-        # coords = coords / patch_size_src
-        # coords -= coords.min(axis=0, keepdims=True)
-        # normalized_coords = torch.from_numpy(coords)
         
         remap_coords = map_to_integer_grid(coords, patch_size_src)
         coordinates = remap_coords
@@ -400,15 +470,9 @@ for item in tqdm(target_dataset):
             ### Match
             mol_path = datastem.joinpath(f'st/{item}.h5ad')
             adata = sc.read_h5ad(mol_path)
-            
-            # Standardize and Aggregate
-            adata = clean_var_names(adata, verbose=False)
-            adata = aggregate_adata(adata, verbose=False)
-            
-            # Filter BLANK_ genes for Xenium datasets
-            if is_xenium_dataset(dataset_name):
-                adata = filter_blank_genes(adata, verbose=False)
-                
+            adata = adata[:, ~adata.var_names.str.startswith('__ambiguous')]
+            adata = avg_duplicate_geneexpr(adata)
+            adata = avg_duplicate_cells(adata)
             barcode_list = [b.item().decode() for b in barcodes]
             adata_barcodes = list(adata.obs.index)
             barcode_to_image_idx = {barcode: idx for idx, barcode in enumerate(barcode_list)}
@@ -417,17 +481,10 @@ for item in tqdm(target_dataset):
             for i, barcode in enumerate(adata_barcodes):
                 if barcode in barcode_to_image_idx:
                     valid_image_indices.append(barcode_to_image_idx[barcode])
-            
-            # Check if we have any matching barcodes
-            if len(valid_image_indices) == 0:
-                tqdm.write(f"Warning: No matching barcodes found for {item}, skipping image processing...")
-                continue
-                
             images = images[valid_image_indices]
             coords = coords[valid_image_indices]
             barcodes = barcodes[valid_image_indices]
             barcode_list = [b.item().decode() for b in barcodes]
-            tqdm.write(f"Dataset {item}: Processing {len(valid_image_indices)} images with matching barcodes")
             ###
 
             num_images = images.shape[0]

@@ -1,319 +1,295 @@
 import scipy
 import scanpy as sc
 import scipy.sparse as sp
-import cupy as cp
 import numpy as np
 import pandas as pd
 import re
 import anndata as ad
+import json
+from typing import Optional, List, Mapping, Sequence, Dict
+import h5py
+from pathlib import Path
 
-def clean_gene_versions(adata, verbose=True):
-    gene_dict = {}  # 存储基因 ID -> 最高版本号
-    original_to_cleaned = {}  # 记录映射关系（原始ID -> 处理后的ID）
-    changes = []  # 记录发生的变更
+GENE_PREFIX_RE = re.compile(r'^(GRCh38|GRCm39|human|mouse|HG38|MM10|GRCh37)[_|-]+', flags=re.IGNORECASE)
 
-    # 第一次遍历：找出每个基因的最高版本
-    for gene in adata.var_names:
-        match = re.match(r"^(.+)\.(\d+)$", gene)
-        if match:
-            base_id, version = match.groups()
-            version = int(version)
-            if base_id not in gene_dict or (gene_dict[base_id] is not None and gene_dict[base_id] < version):
-                gene_dict[base_id] = version
-            original_to_cleaned[gene] = base_id  # 记录映射关系
-            
-            # 记录变更
-            changes.append((gene, base_id))
+def get_ensembl_to_symbol_mapping(
+    organism: str = "human",
+    use_cache: bool = True,
+    cache_file: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Fetch or load Ensembl→Symbol mapping with on-disk caching."""
+    cache_path = cache_file or Path(f".ensembl_to_symbol_{organism}.json")
+
+    if use_cache and cache_path.exists():
+        try:
+            with cache_path.open() as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    try:
+        from pybiomart import Server
+
+        server = Server(host="http://www.ensembl.org")
+        if organism.lower() == "human":
+            dataset_name = "hsapiens_gene_ensembl"
+        elif organism.lower() == "mouse":
+            dataset_name = "mmusculus_gene_ensembl"
         else:
-            if gene not in gene_dict:  # 仅当该基因未出现在字典中时才加入
-                gene_dict[gene] = None
-            original_to_cleaned[gene] = gene  # 记录映射关系
+            raise ValueError(f"Unsupported organism: {organism}")
 
-    # 打印变更信息
-    if verbose and changes:  # 只有当有变更时才打印
-        for original, cleaned in changes:
-            print(f"{original} --> {cleaned}")
+        dataset = server.marts["ENSEMBL_MART_ENSEMBL"].datasets[dataset_name]
+        result = dataset.query(
+            attributes=["ensembl_gene_id", "external_gene_name"],
+            use_attr_names=True
+        )
 
-    # 第二次遍历：保留最高版本，去除其他版本
-    new_var_names = []
-    for gene in adata.var_names:
-        match = re.match(r"^(.+)\.(\d+)$", gene)
-        if match:
-            base_id, version = match.groups()
-            if int(version) == gene_dict[base_id]:
-                new_var_names.append(base_id)
-            else:
-                new_var_names.append(None)
+        mapping: Dict[str, str] = {}
+        for _, row in result.iterrows():
+            ensembl_id = row["ensembl_gene_id"]
+            symbol = row["external_gene_name"]
+            if ensembl_id and symbol:
+                mapping[ensembl_id] = symbol
+                base_id = ensembl_id.split(".")[0]
+                if base_id != ensembl_id:
+                    mapping[base_id] = symbol
+
+        if use_cache:
+            try:
+                with cache_path.open("w") as f:
+                    json.dump(mapping, f, indent=2)
+            except Exception:
+                pass
+
+        return mapping
+
+    except ImportError:
+        print("Warning: pybiomart not installed. Install with: pip install pybiomart")
+        return {}
+    except Exception as exc:
+        print(f"Warning: Failed to fetch Ensembl mapping: {exc}")
+        return {}
+
+def standardize_gene_name(name: str) -> str:
+    """String-level gene cleaning (mirror clean_var_names): drop prefixes/version, uppercase."""
+    cleaned = GENE_PREFIX_RE.sub('', str(name))
+    return cleaned.split('.')[0].upper()
+
+def load_gene_names(
+    h5ad_path: Path,
+    clean_names: bool = False,
+    mapping: Optional[Mapping[str, str]] = None,
+    remove_internal: bool = False,
+) -> List[str]:
+    """Read gene names with optional mapping/cleaning, without loading matrices."""
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+
+    if mapping:
+        adata = convert_ensembl_to_symbol(adata, mapping)
+    if clean_names:
+        adata = clean_var_names(adata, verbose=False)
+
+    names = [str(n) for n in adata.var_names]
+    if remove_internal:
+        names = [n for n in names if n and not n.startswith('__') and n.lower() != 'nan']
+
+    file_handle = getattr(adata, "file", None)
+    if file_handle is not None:
+        file_handle.close()
+    return names
+
+def compute_global_gene_intersection(
+    organ_map: Mapping,
+    data_root: Path,
+    mapping: Optional[Mapping[str, str]] = None,
+    clean_names: bool = True,
+    remove_internal: bool = True,
+) -> List[str]:
+    """Compute intersection of gene sets across all datasets in organ_map."""
+    all_ids = []
+    for organ_datasets in organ_map.values():
+        for ids in organ_datasets.values():
+            all_ids.extend(ids)
+
+    global_set = None
+    for ds_id in all_ids:
+        path = data_root / f"{ds_id}.h5ad"
+        if not path.exists():
+            continue
+        try:
+            genes = set(load_gene_names(path, clean_names=clean_names, mapping=mapping, remove_internal=remove_internal))
+        except Exception:
+            continue
+        if global_set is None:
+            global_set = genes
         else:
-            new_var_names.append(gene)
+            global_set &= genes
+    return sorted(global_set) if global_set else []
 
-    # 过滤并重命名
-    mask = np.array([name is not None for name in new_var_names])
-    adata = adata[:, mask].copy()
-    adata.var_names = np.array([name for name in new_var_names if name is not None])
-
+def clean_var_names(adata: ad.AnnData, verbose: bool = True) -> ad.AnnData:
+    """
+    统一基因命名规范：移除前缀、移除版本号、转大写。
+    """
+    if adata.n_vars == 0:
+        return adata
+    original_names = adata.var_names.astype(str)
+    # 移除前缀 (如 GRCh38__, human--) 和 版本号 (如 .13)
+    cleaned = [re.sub(r'^(GRCh38|GRCm39|human|mouse|HG38|MM10|GRCh37)[_|-]+', '', n, flags=re.IGNORECASE).split('.')[0].upper() for n in original_names]
+    
+    diff_count = sum(1 for i in range(len(cleaned)) if cleaned[i] != original_names[i])
+    if verbose and diff_count > 0:
+        print(f"Standardized {diff_count} gene names.")
+    
+    adata.var_names = cleaned
     return adata
 
-def map_to_integer_grid(coords, patch_size=224, initial_radius=10, expansion_factor=1.1, max_attempts=1000):
+def aggregate_adata(adata: ad.AnnData, strategy: str = 'sum', verbose: bool = False) -> ad.AnnData:
     """
-    Maps coordinates to a [0,0], [0,1], etc. grid system where each patch
-    has a unique position that's as close as possible to the normalized coordinates.
-    
-    Args:
-        coords: numpy array of shape (n, 2) containing the original coordinates
-        patch_size: size of each patch (default: 224)
-        initial_radius: initial search radius for finding grid points (default: 15)
-        expansion_factor: factor to expand search radius if needed (default: 1.5)
-        
-    Returns:
-        numpy array of shape (n, 2) containing the mapped integer grid coordinates
+    对 adata 进行去重：
+    1. 聚合重复基因 (columns)
+    2. 聚合重复条形码 (rows)
+    默认均使用 Sum 策略。
     """
-    # Extract x and y coordinates
-    x_coords = coords[:, 0]
-    y_coords = coords[:, 1]
-    
-    # Normalize coordinates by subtracting minimum and dividing by patch size
-    x_min, y_min = np.min(x_coords), np.min(y_coords)
-    normalized_x = (x_coords - x_min) / patch_size
-    normalized_y = (y_coords - y_min) / patch_size
-    normalized_coords = np.column_stack((normalized_x, normalized_y))
-    
-    # Calculate distance to the nearest integer grid point
-    distances = np.sum((normalized_coords - np.round(normalized_coords))**2, axis=1)
-    
-    # Sort indices by distance (closest to integer grid points first)
-    sorted_indices = np.argsort(distances)
-    
-    # Assign coordinates to integer grid points
-    integer_coords = np.zeros((len(coords), 2), dtype=int)
-    used_coords = set()
-    
-    for idx in sorted_indices:
-        norm_coord = normalized_coords[idx]
-        nearest_grid = (int(round(norm_coord[0])), int(round(norm_coord[1])))
+    # 1. 聚合重复基因
+    if adata.var_names.duplicated().any():
+        old_names = adata.var_names.astype(str)
+        unique_names = []
+        seen = set()
+        for name in old_names:
+            if name not in seen:
+                unique_names.append(name); seen.add(name)
         
-        if nearest_grid not in used_coords:
-            # If the nearest grid point is available, assign it
-            integer_coords[idx] = nearest_grid
-            used_coords.add(nearest_grid)
+        name_to_idx = {name: i for i, name in enumerate(unique_names)}
+        if strategy == 'sum':
+            rows, cols = range(len(old_names)), [name_to_idx[n] for n in old_names]
+            P = sp.csr_matrix((np.ones(len(old_names)), (rows, cols)), shape=(len(old_names), len(unique_names)))
+            new_X = adata.X @ P
+        else: # Max fallback
+            X_dense = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+            new_X_dense = np.zeros((adata.shape[0], len(unique_names)), dtype=X_dense.dtype)
+            for i, name in enumerate(unique_names):
+                indices = [j for j, n in enumerate(old_names) if n == name]
+                new_X_dense[:, i] = np.max(X_dense[:, indices], axis=1)
+            new_X = sp.csr_matrix(new_X_dense) if sp.issparse(adata.X) else new_X_dense
+            
+        adata = ad.AnnData(X=new_X, obs=adata.obs, var=pd.DataFrame(index=unique_names), uns=adata.uns, obsm=adata.obsm)
+
+    # 2. 聚合重复细胞 (Barcodes)
+    if adata.obs_names.duplicated().any():
+        X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
+        df = pd.DataFrame(X, index=adata.obs_names)
+        # 细胞聚合始终使用 sum 以保证 UMI 计数正确
+        df_sum = df.groupby(level=0).sum()
+        unique_obs = adata.obs.loc[~adata.obs_names.duplicated(keep='first')]
+        adata = ad.AnnData(X=df_sum.values, obs=unique_obs.loc[df_sum.index], var=adata.var)
+        
+    return adata
+
+def map_to_integer_grid(coords, patch_size):
+    """将物理坐标映射到整数网格 [0,0], [0,1]..."""
+    x_min, y_min = np.min(coords, axis=0)
+    norm_coords = (coords - [x_min, y_min]) / patch_size
+    integer_coords = np.zeros_like(norm_coords, dtype=int)
+    used = set()
+    # 简单的四舍五入映射，冲突时进行螺旋搜索（简化版逻辑保留）
+    for i, pos in enumerate(norm_coords):
+        target = tuple(np.round(pos).astype(int))
+        if target not in used:
+            integer_coords[i] = target
+            used.add(target)
         else:
-            # Start with the initial search radius
-            search_radius = initial_radius
-            
-            for attempt in range(max_attempts):
-                # Find the next best unused integer grid point
-                candidates = []
-                
-                # Use a spiral search pattern for efficiency
-                for radius in range(1, search_radius + 1):
-                    # Check points at current radius around the nearest grid
-                    for dx in range(-radius, radius + 1):
-                        for dy in [-radius, radius]:  # Top and bottom edges
-                            test_coord = (nearest_grid[0] + dx, nearest_grid[1] + dy)
-                            if test_coord not in used_coords:
-                                dist = (norm_coord[0] - test_coord[0])**2 + (norm_coord[1] - test_coord[1])**2
-                                candidates.append((test_coord, dist))
-                    
-                    for dy in range(-radius + 1, radius):  # Left and right edges (excluding corners)
-                        for dx in [-radius, radius]:
-                            test_coord = (nearest_grid[0] + dx, nearest_grid[1] + dy)
-                            if test_coord not in used_coords:
-                                dist = (norm_coord[0] - test_coord[0])**2 + (norm_coord[1] - test_coord[1])**2
-                                candidates.append((test_coord, dist))
-                
-                if candidates:
-                    # Sort by distance and pick the closest
-                    candidates.sort(key=lambda x: x[1])
-                    best_coord = candidates[0][0]
-                    integer_coords[idx] = best_coord
-                    used_coords.add(best_coord)
-                    break
-                else:
-                    # Expand the search radius and try again
-                    search_radius = int(search_radius * expansion_factor)
-                    # print(f"Expanding search radius to {search_radius} for point {idx}")
-            
-            if attempt == max_attempts - 1 and not candidates:
-                # If we've exhausted all attempts and still can't find a point,
-                # find any unused coordinate regardless of distance
-                min_x, max_x = int(min(normalized_coords[:, 0])) - 10, int(max(normalized_coords[:, 0])) + 10
-                min_y, max_y = int(min(normalized_coords[:, 1])) - 10, int(max(normalized_coords[:, 1])) + 10
-                
-                # Find any unused grid point in the extended range
-                for x in range(min_x, max_x + 1):
-                    for y in range(min_y, max_y + 1):
-                        if (x, y) not in used_coords:
-                            integer_coords[idx] = [x, y]
-                            used_coords.add((x, y))
-                            # print(f"Assigned distant point ({x}, {y}) to coordinate {idx}")
-                            break
-                    if (x, y) not in used_coords:
-                        break
-                
-                # If we still can't find a point, create a new one outside the range
-                if tuple(integer_coords[idx]) not in used_coords:
-                    new_x, new_y = max_x + 1, min_y
-                    integer_coords[idx] = [new_x, new_y]
-                    used_coords.add((new_x, new_y))
-                    # print(f"Created new point outside range: ({new_x}, {new_y}) for coordinate {idx}")
+            # 冲突处理：寻找最近的空位
+            found = False
+            for r in range(1, 20):
+                for dx in range(-r, r+1):
+                    for dy in range(-r, r+1):
+                        new_target = (target[0]+dx, target[1]+dy)
+                        if new_target not in used:
+                            integer_coords[i] = new_target
+                            used.add(new_target); found = True; break
+                    if found: break
+                if found: break
+    return integer_coords - np.min(integer_coords, axis=0)
 
-    min_grid_x = np.min(integer_coords[:, 0])
-    min_grid_y = np.min(integer_coords[:, 1])
-    integer_coords[:, 0] -= min_grid_x
-    integer_coords[:, 1] -= min_grid_y
-    return integer_coords
-        
-def avg_duplicate_geneexpr(adata, verbose=False):
+# --- 常用 IO 与 映射 ---
+def convert_ensembl_to_symbol(adata, mapping):
+    """根据映射表将 Ensembl ID 转换为 Symbol"""
+    new_names = []
+    for n in adata.var_names:
+        mapped = mapping.get(n, n)
+        # 如果映射到 nan，保留原始名称
+        if pd.isna(mapped):
+            new_names.append(n)
+        else:
+            new_names.append(mapped)
+    adata.var_names = new_names
+    return adata
 
-    gene_names = adata.var_names
-    duplicated_genes = pd.Index(gene_names)[pd.Index(gene_names).duplicated(keep=False)]
+def read_h5_data(file_path):
+    import h5py
+    with h5py.File(file_path, 'r') as f:
+        return f['barcode'][()], f['coords'][()], f['img'][()]
 
-    if len(duplicated_genes) == 0:
-        # if verbose:
-        #     print("No duplicated genes found.")
-        return adata
-
-    X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
-    expr_df = pd.DataFrame(X, index=adata.obs_names, columns=gene_names)
-
-    expr_df_avg = expr_df.groupby(expr_df.columns, axis=1).max()
-
-    if verbose:
-        for gene in duplicated_genes.unique():
-            duplicate_indices = np.where(gene_names == gene)[0]
-            print(f"Gene name: {gene}")
-            for idx in duplicate_indices:
-                expr_values = expr_df.iloc[:, idx].values
-                print(f"  Original expression (column {idx}): {expr_values}")
-            print(f"  Avg. Expression: {expr_df_avg[gene].values}\n")
-
-    new_adata = sc.AnnData(
-        X=expr_df_avg.values, 
-        obs=adata.obs.copy(), 
-        var=pd.DataFrame(index=expr_df_avg.columns)
-    )
-
-    return new_adata
-
-def avg_duplicate_cells(adata, verbose=False):
-    cell_names = adata.obs_names
-    duplicated_cells = pd.Index(cell_names)[pd.Index(cell_names).duplicated(keep=False)]
-    
-    if len(duplicated_cells) == 0:
-        if verbose:
-            print("No duplicated cells/barcodes found.")
-        return adata
-        
-    # Convert to array for easier manipulation
-    X = adata.X.toarray() if sp.issparse(adata.X) else adata.X
-    expr_df = pd.DataFrame(X, index=cell_names, columns=adata.var_names)
-    
-    # Group by cell names (rows) and average
-    expr_df_avg = expr_df.groupby(level=0).sum()
-    
-    if verbose:
-        for cell in duplicated_cells.unique():
-            duplicate_indices = np.where(cell_names == cell)[0]
-            print(f"Cell barcode: {cell}")
-            print(f"  Number of duplicates: {len(duplicate_indices)}")
-            # Optional: print some statistics about the merged cells
-            cell_expressions = expr_df.loc[cell]
-            print(f"  Expression correlation: {cell_expressions.T.corr().mean().mean():.4f}")
-            print(f"  Merged {len(duplicate_indices)} duplicate entries into one\n")
-    
-    unique_obs = adata.obs.loc[~adata.obs_names.duplicated(keep='first')]
-    
-    new_adata = sc.AnnData(
-        X=expr_df_avg.values,
-        obs=unique_obs.loc[expr_df_avg.index],  # Keep only obs for remaining cells
-        var=adata.var.copy()
-    )
-    
-    return new_adata
+def create_barcode_mapping(gene_barcodes, image_barcodes):
+    image_barcode_list = [b.item().decode() if hasattr(b, 'item') else str(b) for b in image_barcodes]
+    barcode_to_image_idx = {barcode: idx for idx, barcode in enumerate(image_barcode_list)}
+    v_gene, v_img = [], []
+    for i, barcode in enumerate(gene_barcodes):
+        if barcode in barcode_to_image_idx:
+            v_gene.append(i); v_img.append(barcode_to_image_idx[barcode])
+    return v_gene, v_img
 
 
-def select_top_genes(adata, k=50, log_transform=True):
-    if scipy.sparse.issparse(adata.X):
-        X_np = adata.X.toarray()
-        X = cp.array(X_np)
-    else:
-        X = cp.array(adata.X)
-    
-    if log_transform:
-        X = cp.log1p(X)
-    
-    means = cp.mean(X, axis=0)
-    variances = cp.var(X, axis=0)
-    
-    dispersion = variances / (means + 1e-12)
-    
-    top_genes_idx = cp.argsort(dispersion)[-k:][::-1].get()
-    top_variable_genes = adata.var_names[top_genes_idx]
+# --- Standardized H5 writers to keep output schema consistent ---
+def save_gene_h5(
+    out_path,
+    mol_feats,
+    cords,
+    float_cords,
+    total_umi_counts,
+    orig_cords,
+    gene_names,
+    hvg_indices,
+    heg_indices,
+    global_hvg_indices=None,
+    global_heg_indices=None,
+):
+    """Save gene features with a consistent schema and dtypes."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    top_mean_idx = cp.argsort(means)[-k:][::-1].get()
-    top_mean_genes = adata.var_names[top_mean_idx]
-    
-    return top_variable_genes, top_mean_genes
+    mol_feats = np.asarray(mol_feats, dtype=np.float32)
+    cords = np.asarray(cords, dtype=np.int64)
+    float_cords = np.asarray(float_cords, dtype=np.float32)
+    total_umi_counts = np.asarray(total_umi_counts, dtype=np.float32)
+    orig_cords = np.asarray(orig_cords, dtype=np.float32)
+    gene_names = np.asarray(gene_names, dtype="S")
+    hvg_indices = np.asarray(hvg_indices, dtype=np.int64)
+    heg_indices = np.asarray(heg_indices, dtype=np.int64)
+    if global_hvg_indices is not None:
+        global_hvg_indices = np.asarray(global_hvg_indices, dtype=np.int64)
+    if global_heg_indices is not None:
+        global_heg_indices = np.asarray(global_heg_indices, dtype=np.int64)
 
-def dataset_topgenes(datastem, dataset_list, top_k=3000, normalize_total=False, verbose=False):
-    """
-    从数据集列表中选择高变异基因(HVG)和高表达基因(HEG)
-    
-    参数:
-        dataset_list: 数据集ID列表
-        top_k: 选择的基因数量
-        verbose: 是否显示详细信息
-        
-    返回:
-        sorted_hvg: 排序后的高变异基因名称列表
-        sorted_heg: 排序后的高表达基因名称列表
-    """
-    if verbose:
-        print(f"从{len(dataset_list)}个数据集中选择{top_k}个高变异和高表达基因...")
-    
-    # 读取并预处理所有数据集
-    all_adata = []
-    for item in dataset_list:
-        mol_path = datastem.joinpath(f'st/{item}.h5ad')
-        if not mol_path.exists():
-            if verbose:
-                print(f"File not found: {mol_path}, skipping...")
-            continue
-        adata = sc.read_h5ad(mol_path)
-        adata = adata[:, ~adata.var_names.str.startswith('__ambiguous')]
-        adata = avg_duplicate_geneexpr(adata, verbose=verbose)
-        adata = avg_duplicate_cells(adata)
-        all_adata.append(adata)
-    
-    # 合并数据集
-    combined_adata = ad.concat(all_adata, join='inner')
-    combined_adata.obs_names_make_unique()
-    
-    # 归一化和对数转换
-    if normalize_total:
-        sc.pp.normalize_total(combined_adata, target_sum=1e4)
-    sc.pp.log1p(combined_adata)
-    
-    # 找出高变异基因
-    sc.pp.highly_variable_genes(
-        combined_adata, 
-        n_top_genes=top_k,
-        flavor='seurat',
-        subset=False
-    )
-    
-    # 排序高变异基因
-    hvg_mask = combined_adata.var['highly_variable']
-    sorted_hvg = combined_adata.var_names[hvg_mask][
-        np.argsort(combined_adata.var.loc[hvg_mask, 'dispersions_norm'].values)[::-1]
-    ]
-    
-    # 计算平均表达并找出高表达基因
-    means = np.array(combined_adata.X.mean(axis=0)).flatten()
-    combined_adata.var['means'] = means
-    sorted_heg = combined_adata.var_names[np.argsort(means)[::-1][:top_k]]
-    
-    if verbose:
-        print(f"选择了{len(sorted_hvg)}个高变异基因和{len(sorted_heg)}个高表达基因")
-    
-    return sorted_hvg, sorted_heg
+    with h5py.File(out_path, "w") as f:
+        f.create_dataset("mol_feats", data=mol_feats)
+        f.create_dataset("cords", data=cords)
+        f.create_dataset("float_cords", data=float_cords)
+        f.create_dataset("total_umi_counts", data=total_umi_counts)
+        f.create_dataset("orig_cords", data=orig_cords)
+        f.create_dataset("union_gene_names", data=gene_names)
+        f.create_dataset("hvg_indices", data=hvg_indices)
+        f.create_dataset("heg_indices", data=heg_indices)
+        if global_hvg_indices is not None:
+            f.create_dataset("global_hvg_indices", data=global_hvg_indices)
+        if global_heg_indices is not None:
+            f.create_dataset("global_heg_indices", data=global_heg_indices)
+
+
+def save_mor_h5(out_path, mor_feats):
+    """Save morphology features with a consistent schema and dtypes."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    mor_feats = np.asarray(mor_feats, dtype=np.float32)
+    with h5py.File(out_path, "w") as f:
+        f.create_dataset("mor_feats", data=mor_feats)

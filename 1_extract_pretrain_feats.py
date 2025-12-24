@@ -7,8 +7,7 @@ import numpy as np
 import pandas as pd
 import os
 import pickle
-import torch_geometric
-from torch_geometric.data import Data as gData
+from types import SimpleNamespace
 from torch.utils.data import DataLoader, Dataset
 from transformers import ViTMAEModel, AutoModel
 from transformers import AutoImageProcessor, AutoModelForZeroShotImageClassification, AutoProcessor
@@ -92,11 +91,14 @@ class PNGDataset(Dataset):
 
 from shapely.geometry import Polygon, MultiPolygon, box
 from shapely.ops import unary_union
+from shapely.affinity import scale
+from shapely.prepared import prep
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from rtree import index
 from lxml import etree
 import tempfile
+import random
 
 def xml_position(xml_path, ds_factor=2):
     root = ET.parse(xml_path).getroot()
@@ -181,6 +183,58 @@ def safe_xml_position(xml_path, ds_factor=2):
             raise e  # 重新抛出原始错误
 
 
+def infer_ds_factor(png_paths, annotations, *, patch_size=224, candidate_factors=None, sample_limit=2000):
+    """Infer the downsample factor by comparing patch boxes against annotations."""
+    if candidate_factors is None:
+        candidate_factors = (1, 2, 4, 8, 16)
+
+    # Ensure we have annotations to compare against
+    if annotations is None or annotations.is_empty:
+        return 1
+
+    # Gather patch coordinates from filenames
+    coords = []
+    for path in png_paths:
+        parts = path.stem.split('_')
+        if len(parts) != 2:
+            continue
+        try:
+            x_val = int(parts[0])
+            y_val = int(parts[1])
+        except ValueError:
+            continue
+        coords.append((x_val, y_val))
+
+    if not coords:
+        return 1
+
+    # Limit the number of patches to keep the check lightweight
+    if sample_limit is not None and len(coords) > sample_limit:
+        coords = random.sample(coords, sample_limit)
+
+    patch_boxes = [box(x, y, x + patch_size, y + patch_size) for x, y in coords]
+
+    best_factor = candidate_factors[0]
+    best_hits = -1
+
+    for factor in candidate_factors:
+        # Skip nonsensical factors
+        if factor <= 0:
+            continue
+
+        scaled_annotations = scale(annotations, xfact=1.0 / factor, yfact=1.0 / factor, origin=(0, 0))
+        if scaled_annotations.is_empty:
+            hits = 0
+        else:
+            prepared = prep(scaled_annotations)
+            hits = sum(1 for patch_box in patch_boxes if prepared.intersects(patch_box))
+
+        if hits > best_hits:
+            best_hits = hits
+            best_factor = factor
+
+    return best_factor if best_factor > 0 else 1
+
 # Create a TensorDataset and DataLoader
 slide_labels = pd.read_csv(config['label_file'])
 slide_labels = dict(zip(slide_labels['filename'], slide_labels['type']))
@@ -221,6 +275,7 @@ src_folder = config['src_folder']
 
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+random.seed(42)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 if args.model_type == 'ResNet50':
@@ -332,23 +387,36 @@ if args.model_type == 'CONCH':
     print('Load CONCH weights')
     from conch.open_clip_custom import create_model_from_pretrained
     model, image_processor = create_model_from_pretrained('conch_ViT-B-16', "/data/checkpoints/CONCH/pytorch_model.bin")
-if args.model_type == 'CTrans':
-    print('Load CTrans weights')
-    from ctran import ctranspath
-    mean = (0.485, 0.456, 0.406)
-    std = (0.229, 0.224, 0.225)
+
+
+if args.model_type == 'Virchow2':
+    from timm.data import resolve_data_config
+    from timm.data.transforms_factory import create_transform
+    from timm.layers import SwiGLUPacked
+    print('Load Virchow2 weights')
+    model = timm.create_model("hf-hub:paige-ai/Virchow2", pretrained=True, mlp_layer=SwiGLUPacked, act_layer=torch.nn.SiLU)
+    image_processor = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
+
+if args.model_type == 'GigaPath':
+    print('Load GigaPath weights')
+    model = timm.create_model("hf_hub:prov-gigapath/prov-gigapath", pretrained=True)
     image_processor = transforms.Compose(
         [
-            transforms.Resize(224),
+            transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+            # transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean = mean, std = std)
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ]
     )
-    model = ctranspath()
-    model.head = nn.Identity()
-    td = torch.load('/data/checkpoints/ctranspath.pth')
-    model.load_state_dict(td['model'], strict=True)
-
+if args.model_type == 'Raw':
+    print('Extract Raw images (no encoding)')
+    model = nn.Identity()
+    # Use standard ImageNet normalization or raw tensor depending on requirement. 
+    # Usually standard normalization is expected for downstream DL.
+    image_processor = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
 
 model.eval()
 model.cuda()
@@ -359,37 +427,62 @@ for slide_h5 in tqdm(os.listdir(src_folder)):
     slide_name = slide_h5.split('.')[0]
     # if slide_name in processed_slides:
     #     continue
+    # Build slide path robustly regardless of trailing slash in src_folder
+    slide_path = os.path.join(src_folder, slide_h5)
+    # Skip non-directories (e.g., stray files)
+    if not os.path.isdir(slide_path):
+        continue
     if False:
-        dataset = H5Dataset(f'{src_folder}{slide_h5}')
+        dataset = H5Dataset(slide_path)
     else:
-        dataset = PNGDataset(f'{src_folder}{slide_h5}', image_processor)
+        dataset = PNGDataset(slide_path, image_processor)
     # print(slide_name, len(dataset), f'{src_folder}{slide_h5}')
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=12, pin_memory=True, prefetch_factor=6)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=12, pin_memory=True, prefetch_factor=4)
 
     features_list = []
     position_list = []
+
+    # If the dataset is empty (no PNGs), skip to avoid concat error
+    if len(dataset) == 0:
+        print(f"Warning: no patches found under {slide_path}; skipping slide {slide_name}")
+        with open('error_log.txt', 'a') as f:
+            f.write(f"Empty slide directory: {slide_path}\n")
+        continue
     # with torch.no_grad():
     with torch.inference_mode():
         for batch in dataloader:
-            inputs = batch[0].to(device) #inputs := batch_size, 224, 224, 3
-            inputs = inputs.to(device)
+            inputs = batch[0] # inputs := batch_size, 3, 224, 224
+            
+            if args.model_type != 'Raw':
+                inputs = inputs.to(device)
 
             if args.model_type == 'PLIP':
                 features = model.vision_model(pixel_values=inputs['pixel_values'].squeeze(1)).pooler_output
             elif args.model_type == 'CONCH':
                 features = model.encode_image(inputs, proj_contrast=False, normalize=False)
+            elif args.model_type == 'Raw':
+                # No model forward pass needed for identity, inputs are already the features
+                features = inputs
             else:
                 features = model(inputs)
                 if args.model_type == 'MAE':
                     features = features.last_hidden_state
                     features = torch.mean(features, dim=1)
-                if args.model_type == 'DINOv2':
+                elif args.model_type == 'DINOv2':
                     features = features.last_hidden_state
                     features = features[:, 0, :]
+                elif args.model_type == 'Virchow2':
+                    # Virchow2 returns [batch_size, seq_len, embed_dim]
+                    # Use CLS token (first token) for classification-like features
+                    features = features[:, 0, :]
             # raise ValueError
-            features = features.cpu().squeeze()
-            if len(features.shape) == 1:  # if it's a 1D tensor
+            features = features.cpu()
+            # Ensure features is always 2D: [batch_size, feature_dim]
+            if len(features.shape) == 1:  # Single sample case
                 features = features.unsqueeze(0)
+            elif len(features.shape) == 3:  # [batch_size, 1, feature_dim] case
+                features = features.squeeze(1)
+            # Now features should be [batch_size, feature_dim]
             features_list.append(features)
             position_list.append(batch[1])
 
@@ -403,33 +496,67 @@ for slide_h5 in tqdm(os.listdir(src_folder)):
             f.write(f"Slide name {slide_name} not found\n")
 
     if graph_y is not None:
-        a_graph = gData(
+        a_graph = SimpleNamespace(
             x = torch.concat(features_list),
             pos = torch.concat(position_list),
-            y = None, 
+            y = None,
             graph_y = graph_y,
             slide_index = slide_name)
 
         if 'xml_folder' in config:
             print("xml_folder is defined and its value is:", config['xml_folder'], slide_name)
 
-            xml_folder = config['xml_folder']
-            ds_factor = 1
+            xml_folder = Path(config['xml_folder'])
             patch_size = 224
-            xml_folder = Path(xml_folder)
-
             xml_item = xml_folder.joinpath(f'{a_graph.slide_index}.xml')
+
+            annot_coordinates = MultiPolygon()
+            inferred_ds_factor = 1
+
             if xml_item.exists():
-                positive_union, negative_union = safe_xml_position(xml_item, ds_factor=ds_factor)
-                annot_coordinates = positive_union.difference(negative_union)  # 计算正多边形与负多边形的差集
+                positive_union, negative_union = safe_xml_position(xml_item, ds_factor=1)
+                annot_coordinates_ds1 = positive_union.difference(negative_union)
+
+                candidate_factors = config.get('ds_factor_candidates', [1, 2, 4, 8, 16])
+                if not isinstance(candidate_factors, (list, tuple)):
+                    candidate_factors = [candidate_factors]
+                parsed_factors = []
+                for factor in candidate_factors:
+                    try:
+                        value = int(factor)
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        parsed_factors.append(value)
+                candidate_factors = parsed_factors
+                # Ensure 1 is always considered to avoid empty candidate lists
+                if 1 not in candidate_factors:
+                    candidate_factors = [1] + candidate_factors
+                if not candidate_factors:
+                    candidate_factors = [1, 2, 4, 8, 16]
+
+                inferred_ds_factor = infer_ds_factor(
+                    getattr(dataset, 'png_paths', []),
+                    annot_coordinates_ds1,
+                    patch_size=patch_size,
+                    candidate_factors=candidate_factors
+                )
+                print(f"Inferred ds_factor for {a_graph.slide_index}: {inferred_ds_factor}")
+
+                annot_coordinates = scale(
+                    annot_coordinates_ds1,
+                    xfact=1.0 / inferred_ds_factor,
+                    yfact=1.0 / inferred_ds_factor,
+                    origin=(0, 0)
+                )
             else:
-                annot_coordinates = MultiPolygon()
+                print(f"Annotation file not found for {a_graph.slide_index}, using empty annotations.")
 
             overlap_ratios = []
             for pcoord in a_graph.pos:
                 patch_box = box(pcoord[0], pcoord[1], pcoord[0] + patch_size, pcoord[1] + patch_size)
                 intersection = patch_box.intersection(annot_coordinates)
-                ratio = intersection.area / patch_box.area
+                ratio = intersection.area / patch_box.area if patch_box.area else 0
                 overlap_ratios.append(ratio)
             a_graph.y = torch.stack([torch.tensor(_) for _ in overlap_ratios])
         

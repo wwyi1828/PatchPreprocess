@@ -13,4 +13,4 @@
 dataset_name : 'BRACS'
 label_file : 'labels/BRACS.csv'
 src_folder : '/pool1/data/Extracted_IMAGES/BRACS_val/patches/'
-dst_file: '/data/data/BRACS_UNIv2_val.pkl'
+dst_file: '/data/data/BRACS_V2_val.pkl'
