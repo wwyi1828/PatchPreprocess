@@ -1,0 +1,4 @@
+dataset_name: 'SlideBench'
+label_file: '/data/Projects/preprocess/slidebench_preprocessing/captions/SlideBench_20x_captions.csv'
+src_folder: '/data/data/Extracted_IMAGES/SlideBench_20x/patches/'
+dst_file: '/data/data/SlideBench_20x_CONCH'

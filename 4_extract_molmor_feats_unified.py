@@ -90,30 +90,18 @@ def main():
         hvg_indices, heg_indices = None, None
         if args.gene_prc:
             print("Calculating group rankings...")
-            rank_adatas = []
-            for ds_id in all_ids[:5]:
-                p = ST_DIR / f"{ds_id}.h5ad"
-                if not p.exists(): continue
-                ad_tmp = sc.read_h5ad(p)
-                ad_tmp = clean_var_names(ad_tmp, verbose=False)
-                ad_tmp = convert_ensembl_to_symbol(ad_tmp, e2s)
-                ad_tmp = aggregate_adata(ad_tmp)
-                # Reindex to global universe
-                X_df = pd.DataFrame(ad_tmp.X.toarray() if sp.issparse(ad_tmp.X) else ad_tmp.X, columns=ad_tmp.var_names)
-                X_aligned = X_df.reindex(columns=global_genes, fill_value=0).values
-                rank_adatas.append(ad.AnnData(X=X_aligned, obs=ad_tmp.obs, var=pd.DataFrame(index=global_genes)))
+            rank_adatas = build_rank_adatas_unified(
+                all_ids,
+                ST_DIR,
+                PATCH_DIR,
+                global_genes=global_genes,
+                e2s=e2s,
+            )
             
             if rank_adatas:
-                combined = ad.concat(rank_adatas, join='inner')
-                combined.obs_names_make_unique()
-                # Ranking only: drop all-zero spots so HVG/HEG stats are not skewed (rows kept in downstream saving)
-                sums = np.array(combined.X.sum(axis=1)).flatten()
-                rank_base = combined[sums > 0, :].copy()
-                sc.pp.normalize_total(rank_base, target_sum=1e4)
-                sc.pp.log1p(rank_base)
-                sc.pp.highly_variable_genes(rank_base, n_top_genes=2000, flavor='seurat')
-                hvg_indices = np.argsort(rank_base.var['dispersions_norm'].values)[::-1]
-                heg_indices = np.argsort(np.array(rank_base.X.mean(axis=0)).flatten())[::-1]
+                hvg_indices, heg_indices = compute_hvg_heg_rankings_unified(
+                    rank_adatas, top_k=2000, flavor="seurat"
+                )
 
         # 4. 逐个 Slide 处理
         for ds_id in tqdm(all_ids):

@@ -147,8 +147,10 @@ CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset MISC_brain --i
 CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset MISC_lung --imge_prc V2 --dst_file /data/data/SAPPHIRE --dst_pixelsize 55
 CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset MISC_bowel --imge_prc V2 --dst_file /data/data/SAPPHIRE --dst_pixelsize 55
 CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset NCBI_skin --imge_prc V2 --dst_file /data/data/SAPPHIRE --dst_pixelsize 55
-CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset Xenium_Lung --imge_prc V2 --dst_file /data/data/SAPPHIRE
+CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset Xenium_Lung --gene_prc --imge_prc UNI --dst_file /data/data/SAPPHIRE
+CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats.py --dataset Xenium_Lung --imge_prc Raw --dst_file /data/data/SAPPHIRE
 
 # ALL Visium unified (global gene intersection, ALLVisium layout)
-CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats_unified.py --gene_prc --dst_pixelsize 55 --dst_file /data/data/SAPPHIRE
-CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats_unified.py --imge_prc UNI --dst_pixelsize 55 --dst_file /data/data/SAPPHIRE
+CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats_unified.py --gene_prc --imge_prc R50 --dst_pixelsize 55 --dst_file /data/data/SAPPHIRE/ALLVisium
+CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats_unified.py --imge_prc UNI --dst_pixelsize 55 --dst_file /data/data/SAPPHIRE/ALLVisium
+CUDA_VISIBLE_DEVICES=2 python 4_extract_molmor_feats_unified.py --imge_prc Raw --dst_pixelsize 55 --dst_file /data/data/SAPPHIRE/ALLVisium

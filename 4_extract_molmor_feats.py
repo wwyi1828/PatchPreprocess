@@ -175,56 +175,15 @@ if args.gene_prc:
 
     # Combine all datasets for HVG/HEG selection
     print("Combining datasets for HVG/HEG selection...")
-    combined_adata = ad.concat(all_adata, join='inner')
-    combined_adata.obs_names_make_unique()
-
-    print(f"Combined dataset shape: {combined_adata.shape}")
-    print(f"Number of common genes after inner join: {combined_adata.n_vars}")
-
-    sc.pp.filter_genes(combined_adata, min_cells=3)
-    # n_before = combined_adata.shape[0]
-    # mask = (combined_adata.X.sum(axis=1) > 0)
-    # combined_adata = combined_adata[mask, :].copy()
-    # n_after = combined_adata.shape[0]
-    # print(f"Removed {n_before - n_after} spots/barcodes with zero expression.")
-
-    # Apply full preprocessing for HVG/HEG selection
-    sc.pp.normalize_total(combined_adata, target_sum=1e4)
-    sc.pp.log1p(combined_adata)
-
-    # Find HVG
-    sc.pp.highly_variable_genes(
-        combined_adata,
-        n_top_genes=top_k,
+    union_genes, hvg_indices, heg_indices, sorted_hvg, sorted_heg, orig_shape, orig_n_vars = compute_hvg_heg_union(
+        all_adata,
+        top_k=top_k,
         flavor='seurat',
-        subset=False
+        min_cells=3,
     )
-    hvg_mask = combined_adata.var['highly_variable']
-    sorted_hvg = combined_adata.var_names[hvg_mask][
-        np.argsort(combined_adata.var.loc[hvg_mask, 'dispersions_norm'].values)[::-1]
-    ]
 
-    # Find HEG
-    means = np.array(combined_adata.X.mean(axis=0)).flatten()
-    combined_adata.var['means'] = means
-    sorted_heg = combined_adata.var_names[np.argsort(means)[::-1][:top_k]]
-
-    # Create union genes and indices
-    union_genes = []
-    gene_set = set()
-    for gene in sorted_hvg:
-        if gene not in gene_set:
-            union_genes.append(gene)
-            gene_set.add(gene)
-    for gene in sorted_heg:
-        if gene not in gene_set:
-            union_genes.append(gene)
-            gene_set.add(gene)
-    
-    gene_to_idx = {gene: idx for idx, gene in enumerate(union_genes)}
-    hvg_indices = [gene_to_idx[gene] for gene in sorted_hvg]
-    heg_indices = [gene_to_idx[gene] for gene in sorted_heg]
-
+    print(f"Combined dataset shape: {orig_shape}")
+    print(f"Number of common genes after inner join: {orig_n_vars}")
     print(f"HVG genes: {len(sorted_hvg)}, HEG genes: {len(sorted_heg)}")
     print(f"Union genes: {len(union_genes)}, Overlap: {len(sorted_hvg) + len(sorted_heg) - len(union_genes)}")
 

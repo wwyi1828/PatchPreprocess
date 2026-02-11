@@ -12,6 +12,14 @@ from pathlib import Path
 
 GENE_PREFIX_RE = re.compile(r'^(GRCh38|GRCm39|human|mouse|HG38|MM10|GRCh37)[_|-]+', flags=re.IGNORECASE)
 
+def argsort_desc_nan_last(values: Sequence[float]) -> np.ndarray:
+    """Argsort descending, treating NaN as -inf so they end up last after sorting."""
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return np.array([], dtype=np.int64)
+    arr = np.nan_to_num(arr, nan=-np.inf)
+    return np.argsort(arr, kind="mergesort")[::-1]
+
 def get_ensembl_to_symbol_mapping(
     organism: str = "human",
     use_cache: bool = True,
@@ -238,6 +246,108 @@ def create_barcode_mapping(gene_barcodes, image_barcodes):
         if barcode in barcode_to_image_idx:
             v_gene.append(i); v_img.append(barcode_to_image_idx[barcode])
     return v_gene, v_img
+
+
+def build_rank_adatas_unified(
+    all_ids: Sequence[str],
+    st_dir: Path,
+    patch_dir: Path,
+    *,
+    global_genes: Sequence[str],
+    e2s: Mapping[str, str],
+) -> List[ad.AnnData]:
+    rank_adatas: List[ad.AnnData] = []
+    for ds_id in all_ids:
+        p = st_dir / f"{ds_id}.h5ad"
+        mor_path = patch_dir / f"{ds_id}.h5"
+        if not p.exists() or not mor_path.exists():
+            continue
+        ad_tmp = sc.read_h5ad(p)
+        ad_tmp = clean_var_names(ad_tmp, verbose=False)
+        ad_tmp = convert_ensembl_to_symbol(ad_tmp, e2s)
+        ad_tmp = aggregate_adata(ad_tmp)
+        barcodes, coords, images = read_h5_data(mor_path)
+        gene_barcodes = list(ad_tmp.obs.index)
+        v_gene, v_img = create_barcode_mapping(gene_barcodes, barcodes)
+        if not v_gene:
+            continue
+        ad_tmp = ad_tmp[v_gene].copy()
+        X_df = pd.DataFrame(
+            ad_tmp.X.toarray() if sp.issparse(ad_tmp.X) else ad_tmp.X,
+            columns=ad_tmp.var_names,
+        )
+        X_aligned = X_df.reindex(columns=global_genes, fill_value=0).values
+        rank_adatas.append(
+            ad.AnnData(X=X_aligned, obs=ad_tmp.obs, var=pd.DataFrame(index=global_genes))
+        )
+    return rank_adatas
+
+
+def compute_hvg_heg_rankings_unified(
+    rank_adatas: Sequence[ad.AnnData],
+    *,
+    top_k: int = 2000,
+    flavor: str = "seurat",
+):
+    combined = ad.concat(list(rank_adatas), join="inner")
+    combined.obs_names_make_unique()
+    sums = np.array(combined.X.sum(axis=1)).flatten()
+    rank_base = combined[sums > 0, :].copy()
+    sc.pp.normalize_total(rank_base, target_sum=1e4)
+    sc.pp.log1p(rank_base)
+    sc.pp.highly_variable_genes(rank_base, n_top_genes=top_k, flavor=flavor)
+    hvg_indices = argsort_desc_nan_last(rank_base.var["dispersions_norm"].values)
+    heg_indices = argsort_desc_nan_last(np.array(rank_base.X.mean(axis=0)).flatten())
+    return hvg_indices, heg_indices
+
+
+def compute_hvg_heg_union(
+    adatas: Sequence[ad.AnnData],
+    *,
+    top_k: int = 2000,
+    flavor: str = "seurat",
+    min_cells: int = 3,
+):
+    combined_adata = ad.concat(list(adatas), join="inner")
+    combined_adata.obs_names_make_unique()
+    orig_shape = combined_adata.shape
+    orig_n_vars = combined_adata.n_vars
+
+    sc.pp.filter_genes(combined_adata, min_cells=min_cells)
+    sc.pp.normalize_total(combined_adata, target_sum=1e4)
+    sc.pp.log1p(combined_adata)
+
+    sc.pp.highly_variable_genes(
+        combined_adata,
+        n_top_genes=top_k,
+        flavor=flavor,
+        subset=False,
+    )
+    hvg_mask = combined_adata.var["highly_variable"]
+    sorted_hvg = combined_adata.var_names[hvg_mask][
+        argsort_desc_nan_last(combined_adata.var.loc[hvg_mask, "dispersions_norm"].values)
+    ]
+
+    means = np.array(combined_adata.X.mean(axis=0)).flatten()
+    combined_adata.var["means"] = means
+    sorted_heg = combined_adata.var_names[np.argsort(means)[::-1][:top_k]]
+
+    union_genes: List[str] = []
+    gene_set = set()
+    for gene in sorted_hvg:
+        if gene not in gene_set:
+            union_genes.append(gene)
+            gene_set.add(gene)
+    for gene in sorted_heg:
+        if gene not in gene_set:
+            union_genes.append(gene)
+            gene_set.add(gene)
+
+    gene_to_idx = {gene: idx for idx, gene in enumerate(union_genes)}
+    hvg_indices = [gene_to_idx[gene] for gene in sorted_hvg]
+    heg_indices = [gene_to_idx[gene] for gene in sorted_heg]
+
+    return union_genes, hvg_indices, heg_indices, sorted_hvg, sorted_heg, orig_shape, orig_n_vars
 
 
 # --- Standardized H5 writers to keep output schema consistent ---
