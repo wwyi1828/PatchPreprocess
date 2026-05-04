@@ -1,0 +1,5 @@
+dataset_name: SlideBench
+label_file: examples/labels/slidebench_labels.example.csv
+caption_file: examples/data/slideinstruct_caption.example.json
+src_folder: /path/to/clam_patches/SlideBench/patches
+dst_file: outputs/SlideBench_CONCH

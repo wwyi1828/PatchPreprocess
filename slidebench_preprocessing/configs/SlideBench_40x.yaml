@@ -1,4 +1,0 @@
-dataset_name: 'SlideBench'
-label_file: '/data/Projects/preprocess/slidebench_preprocessing/captions/SlideBench_40x_captions.csv'
-src_folder: '/data/data/Extracted_IMAGES/SlideBench_40x/patches/'
-dst_file: '/data/data/SlideBench_40x_CONCH'

@@ -1,0 +1,7 @@
+dataset_name: Camelyon16
+label_file: examples/labels/camelyon16_labels.example.csv
+src_folder: /path/to/clam_patches/Camelyon16/patches
+xml_folder: /path/to/Camelyon16/lesion_annotations
+dst_file: outputs/C16_CluBYOL_R18.pkl
+ckpt_path: /path/to/CluBYOL_R18_C16_49.pth.tar
+ds_factor_candidates: [1, 2, 4, 8, 16]

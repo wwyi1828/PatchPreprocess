@@ -1,0 +1,20 @@
+[
+  {
+    "image": ["./BRCA/TCGA-XX-0001-01Z-00-DX1.csv"],
+    "conversations": [
+      {
+        "from": "gpt",
+        "value": "Example slide caption for a BRCA whole-slide image."
+      }
+    ]
+  },
+  {
+    "image": ["./LUAD/TCGA-XX-0002-01Z-00-DX1.csv"],
+    "conversations": [
+      {
+        "from": "gpt",
+        "value": "Example slide caption for a LUAD whole-slide image."
+      }
+    ]
+  }
+]

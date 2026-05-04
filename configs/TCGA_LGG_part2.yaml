@@ -1,4 +1,0 @@
-dataset_name: TCGA_LGG
-label_file: labels/TCGA_LGG.csv
-src_folder: /pool3/data/Extracted_IMAGES/TCGA_LGG_unique/patches_part2
-dst_file: /pool3/data/TCGA_LGG_unique_UNI_part2

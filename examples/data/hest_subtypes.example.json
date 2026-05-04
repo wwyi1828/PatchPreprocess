@@ -1,0 +1,8 @@
+{
+  "Human_Brain_visium_MISC": {
+    "glioma": ["MISC1", "MISC2"]
+  },
+  "Human_Skin_visium_NCBI": {
+    "melanoma": ["NCBI469"]
+  }
+}

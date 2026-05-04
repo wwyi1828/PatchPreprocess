@@ -1,9 +1,0 @@
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_757.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_754.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_753.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_752.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_750.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_759.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_749.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_756.svs
-wget ftp://histoimage.na.icar.cnr.it/BRACS_WSI/train/Group_MT/Type_IC/BRACS_773.svs

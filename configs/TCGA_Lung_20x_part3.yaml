@@ -1,4 +1,0 @@
-dataset_name: TCGA_LUNG
-label_file: labels/TCGA_Lung.csv
-src_folder: /data/data/Extracted_IMAGES/TCGA_Lung_20x/patches_part3
-dst_file: /data/data/TCGA_Lung_20x_UNI_part3

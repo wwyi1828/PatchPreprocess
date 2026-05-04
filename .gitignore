@@ -32,8 +32,16 @@ wheels/
 
 # Project Specific Caches & Large Files
 .pybiomart.sqlite
+.ensembl_to_symbol_*.json
 .claude/
+.codex/
+.agents/
+.queue_state/
 visium_merge/
+slidebench_preprocessing/
+/outputs/
+/checkpoints/
+/data/
 
 # Potential Data/Log Files
 *.log
@@ -41,3 +49,7 @@ visium_merge/
 *.pkl
 *.npy
 *.npz
+*.h5
+*.svs
+*.tif
+*.tiff
